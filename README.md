@@ -1,3 +1,5 @@
+
+
 # Dlib compiled wheels for Python on Windows X64
 Dlib compiled binary (.whl) for python on windows x64
 
@@ -5,7 +7,7 @@ Dlib compiled binary (.whl) for python on windows x64
 
 1. Download the file
 
-2. open cmd and locate to the folder where the file is
+2. open cmd and navigate to the folder where the file is
 
 3. Install dlib through "pip"
 
