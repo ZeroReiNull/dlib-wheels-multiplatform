@@ -68,3 +68,7 @@ Use [GitHub Releases](https://github.com/ZeroReiNull/dlib-wheels-multiplatform/r
 - Test the wheel on your actual target device and workload before relying on it.
 - The upstream dlib project and its [license](https://github.com/davisking/dlib/blob/master/dlib/LICENSE.txt) remain authoritative. These binaries are independently built and distributed.
 - To report a packaging/build issue, open a [repository issue](https://github.com/ZeroReiNull/dlib-wheels-multiplatform/issues). For problems in dlib itself, refer to the upstream project.
+
+## Acknowledgements
+
+Build workflow inspired in part by [alesanfra/dlib-wheels](https://github.com/alesanfra/dlib-wheels).
