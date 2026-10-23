@@ -1,113 +1,120 @@
-
 name: Build dlib Wheels
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Official dlib tag"
-        required: true
-        default: "v20.0.1"
-        type: string
+      force:
+        description: "Rebuild even if a release exists"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-env:
-  DLIB_VERSION: ${{ inputs.version }}
+concurrency:
+  group: dlib-wheels
+  cancel-in-progress: false
+  queue: max
 
 jobs:
+  resolve:
+    name: Resolve latest version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - name: Check upstream and existing release
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          VERSION=$(gh api repos/davisking/dlib/releases/latest --jq '.tag_name')
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Unexpected upstream version: $VERSION"
+            exit 1
+          fi
+
+          TAG="wheels-$VERSION"
+          BUILD=true
+
+          if RESPONSE=$(gh api "repos/$GH_REPO/releases/tags/$TAG" 2>release-error.txt); then
+            if [[ "$FORCE" == "true" ]]; then
+              TAG="${TAG}-r${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            elif jq -e '(.draft == false) and any(.assets[]?; .name == "SHA256SUMS.txt") and ([.assets[]? | select(.name | endswith(".whl"))] | length >= 36)' <<< "$RESPONSE" >/dev/null; then
+              BUILD=false
+            else
+              echo "::error::Existing release is a draft or missing checksums. Repair it manually or run with force."
+              exit 1
+            fi
+          elif ! grep -q 'HTTP 404' release-error.txt; then
+            cat release-error.txt >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          {
+            echo "### dlib $VERSION"
+            echo "Build: $BUILD"
+            echo "Release: $TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: ${{ matrix.platform }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
     runs-on: ${{ matrix.os }}
-
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: manylinux_x86_64
-            os: ubuntu-latest
-            arch: x86_64
-
-          - platform: manylinux_aarch64
-            os: ubuntu-24.04-arm
-            arch: aarch64
-
-          - platform: musllinux_x86_64
-            os: ubuntu-latest
-            arch: x86_64
-
-          - platform: musllinux_aarch64
-            os: ubuntu-24.04-arm
-            arch: aarch64
-
-          - platform: macosx_arm64
-            os: macos-14
-            arch: arm64
-
-          - platform: win_amd64
-            os: windows-latest
-            arch: AMD64
-
-          - platform: win_arm64
-            os: windows-latest
-            arch: ARM64
-
+          - { platform: manylinux_x86_64, os: ubuntu-latest, arch: x86_64 }
+          - { platform: manylinux_aarch64, os: ubuntu-24.04-arm, arch: aarch64 }
+          - { platform: musllinux_x86_64, os: ubuntu-latest, arch: x86_64 }
+          - { platform: musllinux_aarch64, os: ubuntu-24.04-arm, arch: aarch64 }
+          - { platform: macosx_arm64, os: macos-14, arch: arm64 }
+          - { platform: win_amd64, os: windows-latest, arch: AMD64 }
     steps:
-      - name: Checkout dlib
-        uses: actions/checkout@v4
+      - name: Checkout official dlib
+        uses: actions/checkout@v7
         with:
           repository: davisking/dlib
-          ref: ${{ env.DLIB_VERSION }}
+          ref: ${{ needs.resolve.outputs.version }}
           path: dlib
           persist-credentials: false
 
-      - name: Configure build
-        shell: bash
-        working-directory: dlib
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          setup = Path("setup.py")
-          text = setup.read_text()
-          text = text.replace(
-              "_cmake_extra_options = []",
-              "_cmake_extra_options = ['-DDLIB_NO_GUI_SUPPORT=ON']",
-          )
-          setup.write_text(text)
-
-          config = Path("pyproject.toml")
-          text = config.read_text()
-          text = text.replace(
-              'requires = ["setuptools", "wheel"]',
-              'requires = ["setuptools", "wheel", "cmake>=3.31.0"]',
-          )
-          config.write_text(text)
-          PY
-
-      - name: Build wheels
+      - name: Build and test wheels
         uses: pypa/cibuildwheel@v4.2.1
         with:
           package-dir: dlib
         env:
-          CIBW_BUILD: cp3*-${{ matrix.platform }}
           CIBW_ARCHS: ${{ matrix.arch }}
-          CIBW_PROJECT_REQUIRES_PYTHON: ">=3.10"
+          CIBW_BUILD: cp3*-${{ matrix.platform }}
           CIBW_SKIP: "cp3*t-*"
-          CIBW_TEST_SKIP: "*-win_arm64"
-
-          CIBW_BEFORE_BUILD: pip install cmake
-
+          CIBW_PROJECT_REQUIRES_PYTHON: ">=3.10,<3.16"
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_ENVIRONMENT: >-
+            DLIB_NO_GUI_SUPPORT=ON
+            EXPECTED_DLIB_VERSION=${{ needs.resolve.outputs.version }}
           CIBW_TEST_COMMAND: >-
-            python -c "import dlib;
+            python -c "import os, dlib;
             from importlib.metadata import version;
-            assert dlib.__version__ == version('dlib')"
-
+            expected = os.environ['EXPECTED_DLIB_VERSION'].removeprefix('v');
+            actual = version('dlib');
+            assert actual == expected or (expected.count('.') == 1 and actual == expected + '.0');
+            assert dlib.__version__ == actual;
+            assert callable(dlib.get_frontal_face_detector())"
           MACOSX_DEPLOYMENT_TARGET: "14.0"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform }}
           path: wheelhouse/*.whl
@@ -115,48 +122,66 @@ jobs:
           retention-days: 7
 
   release:
-    name: Publish Release
-    needs: build
+    name: Publish GitHub Release
+    needs: [resolve, build]
+    if: needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
-
     steps:
       - name: Download wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - name: Verify artifacts
-        shell: bash
+      - name: Validate all platforms and versions
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          shopt -s nullglob
-          wheels=(dist/*.whl)
-          if (( ${#wheels[@]} == 0 )); then
-            echo "No wheels found"
-            exit 1
-          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
 
+          names = [p.name for p in Path('dist').glob('*.whl')]
+          version = os.environ['VERSION'].removeprefix('v')
+          versions = (version, version + '.0') if version.count('.') == 1 else (version,)
+          pythons = ('cp310', 'cp311', 'cp312', 'cp313', 'cp314', 'cp315')
+          platforms = (
+              ('manylinux', 'x86_64'), ('manylinux', 'aarch64'),
+              ('musllinux', 'x86_64'), ('musllinux', 'aarch64'),
+              ('macosx', 'arm64'), ('win', 'amd64'),
+          )
+          missing = [
+              f'{py} / {system}-{arch}'
+              for py in pythons for system, arch in platforms
+              if not any(
+                  name.startswith(tuple(f'dlib-{v}-{py}-{py}-' for v in versions))
+                  and system in name
+                  and name.endswith(f'{arch}.whl')
+                  for name in names
+              )
+          ]
+          if missing:
+              raise SystemExit('Missing wheels: ' + ', '.join(missing))
+          print(f'Validated {len(names)} wheels')
+          PY
           cd dist
           sha256sum *.whl > SHA256SUMS.txt
 
-      - name: Publish GitHub Release
+      - name: Create and publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        shell: bash
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          TAG="wheels-${DLIB_VERSION}"
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
-            exit 1
-          fi
-
+          set -euo pipefail
           gh release create "$TAG" dist/* \
-            --title "dlib ${DLIB_VERSION#v} Wheels" \
-            --notes "Unofficial precompiled dlib wheels built from the official source. Includes SHA256 checksums." \
-            --latest=false
+            --title "dlib ${VERSION#v} Wheels" \
+            --notes "Unofficial binary builds of https://github.com/davisking/dlib/releases/tag/$VERSION. Built by https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID. Includes SHA256SUMS.txt. macOS 14+ ARM64, Windows AMD64, and Linux manylinux/musllinux x86_64/aarch64." \
+            --latest=false \
+            --draft
+          gh release edit "$TAG" --draft=false
+          echo "### Published $TAG" >> "$GITHUB_STEP_SUMMARY"
